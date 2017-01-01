@@ -1,12 +1,14 @@
 package command
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -45,96 +47,80 @@ func (c *RefreshCommand) Run(args []string) int {
 		}
 	}
 
-	// Check if remote state is enabled
-	state, err := c.State()
+	// Load the backend
+	b, err := c.Backend(nil)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
 		return 1
 	}
 
-	// Verify that the state path exists. The "ContextArg" function below
-	// will actually do this, but we want to provide a richer error message
-	// if possible.
-	if !state.State().IsRemote() {
-		if _, err := os.Stat(c.Meta.statePath); err != nil {
-			if os.IsNotExist(err) {
-				c.Ui.Error(fmt.Sprintf(
-					"The Terraform state file for your infrastructure does not\n"+
-						"exist. The 'refresh' command only works and only makes sense\n"+
-						"when there is existing state that Terraform is managing. Please\n"+
-						"double-check the value given below and try again. If you\n"+
-						"haven't created infrastructure with Terraform yet, use the\n"+
-						"'terraform apply' command.\n\n"+
-						"Path: %s",
-					c.Meta.statePath))
-				return 1
-			}
+	// Build the operation
+	opReq, err := b.Operation()
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error preparing operation: %s", err))
+		return 1
+	}
+	opReq.Sequence = []backend.OperationType{backend.OperationTypeRefresh}
+	opReq.ModulePath = configPath
 
-			c.Ui.Error(fmt.Sprintf(
-				"There was an error reading the Terraform state that is needed\n"+
-					"for refreshing. The path and error are shown below.\n\n"+
-					"Path: %s\n\nError: %s",
-				c.Meta.statePath,
-				err))
-			return 1
-		}
+	// Perform the operation
+	op, err := b.Operation(context.Background(), opReq)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error starting operation: %s", err))
+		return 1
 	}
 
-	// This is going to keep track of shadow errors
-	var shadowErr error
-
-	// Build the context based on the arguments given
-	ctx, _, err := c.Context(contextOpts{
-		Path:        configPath,
-		StatePath:   c.Meta.statePath,
-		Parallelism: c.Meta.parallelism,
-	})
-	if err != nil {
+	// Wait for the operation to complete
+	<-op.Done()
+	if err := op.Err; err != nil {
 		c.Ui.Error(err.Error())
 		return 1
 	}
 
-	if err := ctx.Input(c.InputMode()); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error configuring: %s", err))
-		return 1
-	}
-
-	// Record any shadow errors for later
-	if err := ctx.ShadowError(); err != nil {
-		shadowErr = multierror.Append(shadowErr, multierror.Prefix(
-			err, "input operation:"))
-	}
-
-	if !validateContext(ctx, c.Ui) {
-		return 1
-	}
-
-	newState, err := ctx.Refresh()
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error refreshing state: %s", err))
-		return 1
-	}
-
-	log.Printf("[INFO] Writing state output to: %s", c.Meta.StateOutPath())
-	if err := c.Meta.PersistState(newState); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
-		return 1
-	}
-
-	if outputs := outputsAsString(newState, terraform.RootModulePath, ctx.Module().Config().Outputs, true); outputs != "" {
+	// Output the outputs
+	if outputs := outputsAsString(op.State, terraform.RootModulePath, nil, true); outputs != "" {
 		c.Ui.Output(c.Colorize().Color(outputs))
 	}
 
-	// Record any shadow errors for later
-	if err := ctx.ShadowError(); err != nil {
-		shadowErr = multierror.Append(shadowErr, multierror.Prefix(
-			err, "refresh operation:"))
-	}
-
-	// If we have an error in the shadow graph, let the user know.
-	c.outputShadowError(shadowErr, true)
-
 	return 0
+
+	/*
+		// Check if remote state is enabled
+		state, err := c.State()
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+			return 1
+		}
+
+		// Verify that the state path exists. The "ContextArg" function below
+		// will actually do this, but we want to provide a richer error message
+		// if possible.
+		if !state.State().IsRemote() {
+			if _, err := os.Stat(c.Meta.statePath); err != nil {
+				if os.IsNotExist(err) {
+					c.Ui.Error(fmt.Sprintf(
+						"The Terraform state file for your infrastructure does not\n"+
+							"exist. The 'refresh' command only works and only makes sense\n"+
+							"when there is existing state that Terraform is managing. Please\n"+
+							"double-check the value given below and try again. If you\n"+
+							"haven't created infrastructure with Terraform yet, use the\n"+
+							"'terraform apply' command.\n\n"+
+							"Path: %s",
+						c.Meta.statePath))
+					return 1
+				}
+
+				c.Ui.Error(fmt.Sprintf(
+					"There was an error reading the Terraform state that is needed\n"+
+						"for refreshing. The path and error are shown below.\n\n"+
+						"Path: %s\n\nError: %s",
+					c.Meta.statePath,
+					err))
+				return 1
+			}
+		}
+	*/
+
 }
 
 func (c *RefreshCommand) Help() string {
